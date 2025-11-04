@@ -1,9 +1,8 @@
 from __future__ import annotations
 """
-LangGraph workflow: routes checks to either an email-domain tool or a monthly-aggregation tool,
-then writes results back to checks.xlsx and a summary report.xlsx.
+LangGraph workflow: routes checks to email-domain tool, exact-email validation tool,
+and monthly-aggregation tool. Writes results to checks.xlsx and report.xlsx.
 """
-
 from pathlib import Path
 import os
 import re
@@ -18,12 +17,9 @@ from langchain_core.tools import tool
 from langgraph.graph import START, END, StateGraph
 
 # ---------------------- Config & Paths ----------------------
-# Reads .env (or ENV_FILE) to resolve file locations and provider settings.
-# All relative paths are resolved against BASE_DIR.
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_FILE = os.getenv("ENV_FILE")
 load_dotenv(ENV_FILE or (SCRIPT_DIR / ".env"))
-
 BASE = Path(os.getenv("BASE_DIR", str(SCRIPT_DIR)))
 
 def _resolve_file(env_key: str, default_name: str) -> Path:
@@ -36,16 +32,7 @@ CHECKS_PATH = _resolve_file("CHECKS_FILE", "checks.xlsx")
 REPORT_PATH = _resolve_file("REPORT_FILE", "report.xlsx")
 METRICS_PATH = _resolve_file("METRICS_FILE", "metrics.xlsx")
 
-# Provider envs and precedence (optional LLM routing for future use)
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2025-01-01-preview")
-AZURE_ENDPOINT = os.getenv("base_url")
-LLMFOUNDRY_TOKEN = os.getenv("LLMFOUNDRY_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PROVIDER = "azure" if LLMFOUNDRY_TOKEN else ("openai" if OPENAI_API_KEY else "none")
-
 # ---------------------- Utilities ----------------------
-# Helpers, constants and regex used by tools and parsers.
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 MONTH_NAMES = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
 COMPARATORS = {
@@ -56,6 +43,14 @@ COMPARATORS = {
 NUM_RE = re.compile(r"(?<![\w.])([0-9]+(?:\.[0-9]+)?)")
 
 # ---------------------- Tools ----------------------
+def email_in_contacts(email: str) -> bool:
+    """Return True if exact email exists in contacts.xlsx; else False."""
+    try:
+        df = pd.read_excel(CONTACTS_PATH)
+        emails = {str(e).strip().lower() for e in df.get("email", []) if isinstance(e, str)}
+        return isinstance(email, str) and (email.strip().lower() in emails)
+    except Exception:
+        return False
 
 def extract_domain(email: str) -> str | None:
     """Validate email and return the domain part after '@' in lowercase."""
@@ -68,11 +63,7 @@ def extract_domain(email: str) -> str | None:
 
 @tool
 def domain_check(email: str) -> dict:
-    """Return whether the email domain exists among contacts.xlsx domains.
-    - Loads contacts.xlsx and builds a set of domains from contact emails.
-    - Extracts the domain from the input email and checks membership.
-    Returns: {result, reason, domain}
-    """
+    """Return whether the email domain exists among contacts.xlsx domains."""
     df = pd.read_excel(CONTACTS_PATH)
     domains = {extract_domain(e) for e in df.get("email", []) if extract_domain(e)}
     dom = extract_domain(email)
@@ -86,12 +77,23 @@ def domain_check(email: str) -> dict:
     }
 
 @tool
+def email_exists(email: str) -> dict:
+    """Return Success if the exact email is present in contacts.xlsx; else Failed."""
+    df = pd.read_excel(CONTACTS_PATH)
+    emails = {str(e).strip().lower() for e in df.get("email", []) if isinstance(e, str)}
+    if not isinstance(email, str) or not EMAIL_RE.match(email.strip()):
+        return {"result": "Failed", "reason": "Invalid or missing email format", "email": email}
+    ok = email.strip().lower() in emails
+    return {
+        "result": "Success" if ok else "Failed",
+        "reason": "Email found in contacts" if ok else "Email not found in contacts",
+        "email": email,
+    }
+
+@tool
 def monthly_aggregate(metric: str, period: str) -> dict:
     """Aggregate values from metrics.xlsx for a given metric and period.
-    period format:
-      - month:YYYY-MM
-      - week:YYYY-WW (ISO week)
-    Returns: { "period": str, "value": float }
+    period format: month:YYYY-MM or week:YYYY-WW (ISO week). Returns {period, value}.
     """
     mdf = pd.read_excel(METRICS_PATH, parse_dates=["date"])  # ensure datetime
     if metric:
@@ -113,20 +115,16 @@ def monthly_aggregate(metric: str, period: str) -> dict:
 # ---------------------- Parsing ----------------------
 
 def parse_check(text: str) -> dict:
-    """Parse check text into routing + parameters with robust target extraction.
-    Extracts:
-      - kind: one of "mail", "monthly", or "skip"
-      - metric: e.g., "csr_supply" or "spend"
-      - period: "month:YYYY-MM" or "week:YYYY-WW"
-      - comparator: lt/le/gt/ge/eq/ne (from symbols or natural phrases)
-      - target: numeric value (excludes years and period numbers)
+    """Parse check text into routing + parameters.
+    Returns {kind: mail_domain|mail_exact|monthly|skip, metric, period, comparator, target}.
     """
     original = text or ""
     t = original.lower()
 
-    # Detect intent
-    mail_hint = ("email" in t or "domain" in t)
+    # Intent hints
     monthly_hint = ("aggregate" in t or "csr" in t or "supply" in t or "spend" in t or any(k in t for k in COMPARATORS))
+    mail_exact_hint = ("email address is valid" in t or "is email address valid" in t or "email exists" in t or "email present" in t)
+    mail_domain_hint = ("email" in t or "domain" in t)
 
     # Comparator phrase and span
     comp = None
@@ -138,25 +136,18 @@ def parse_check(text: str) -> dict:
             comp_span = m.span()
             break
 
-    # All number candidates with spans
+    # Numeric target, excluding years/period parts
     num_matches = [(m.group(1), m.span()) for m in NUM_RE.finditer(t)]
-
-    # Exclude years, year-month parts, and week numbers
     exclude_spans = []
     for m in re.finditer(r"\b20\d{2}\b", t):
         exclude_spans.append(m.span())
     for m in re.finditer(r"\b(20\d{2})-(\d{1,2})\b", t):
-        exclude_spans.append(m.span(1))
-        exclude_spans.append(m.span(2))
+        exclude_spans.append(m.span(1)); exclude_spans.append(m.span(2))
     for m in re.finditer(r"\bweek\s*(\d{1,2})\b", t):
         exclude_spans.append(m.span(1))
-
     def overlaps(span, banned):
         return any(not (span[1] <= b[0] or span[0] >= b[1]) for b in banned)
-
     filtered_nums = [(val, span) for (val, span) in num_matches if not overlaps(span, exclude_spans)]
-
-    # Choose target: prefer first number to the right of comparator; else last filtered number
     target = None
     if comp_span:
         right_side = [(val, span) for (val, span) in filtered_nums if span[0] >= comp_span[1]]
@@ -165,8 +156,8 @@ def parse_check(text: str) -> dict:
     if target is None and filtered_nums:
         target = float(filtered_nums[-1][0])
 
-    # Month parsing
-    month = None; year = None
+    # Period
+    month = None; year = None; week = None
     for name, idx in MONTH_NAMES.items():
         m = re.search(r"\b" + re.escape(name) + r"\b", t)
         if m:
@@ -178,49 +169,39 @@ def parse_check(text: str) -> dict:
         ym2 = re.search(r"\b(20\d{2})-(\d{1,2})\b", t)
         if ym2:
             year = int(ym2.group(1)); month = int(ym2.group(2))
-
-    # Week parsing
-    week = None
     if "week" in t:
         w = re.search(r"\bweek\s*(\d{1,2})\b", t)
         if w:
-            week = int(w.group(1))
-            if not year:
-                year = date.today().year
+            week = int(w.group(1)); year = year or date.today().year
         elif "this week" in t:
-            iso = date.today().isocalendar()
-            week = int(iso.week); year = int(iso.year)
-
-    # Metric detection
-    metric = "csr_supply" if ("csr" in t or "supply" in t) else ("spend" if "spend" in t else None)
-
-    # Period
+            iso = date.today().isocalendar(); week = int(iso.week); year = int(iso.year)
     period = None
     if month and year:
         period = f"month:{year}-{month:02d}"
     elif week and year:
         period = f"week:{year}-{week:02d}"
 
-    # Decide kind (mail takes precedence only when monthly not hinted)
-    if mail_hint and not monthly_hint:
-        kind = "mail"
+    # Decide kind with mail precedence
+    if mail_exact_hint:
+        kind = "mail_exact"
+    elif mail_domain_hint and not monthly_hint:
+        kind = "mail_domain"
     elif monthly_hint:
         kind = "monthly"
     else:
         kind = "skip"
 
-    # If numeric check with a bare number and no comparator, assume equals
+    # If monthly check has a number but no comparator, assume equals
     if kind == "monthly" and target is not None and comp is None:
         comp = "eq"
 
-    return {"kind": kind, "metric": metric, "period": period, "comparator": comp, "target": target}
+    return {"kind": kind, "metric": ("csr_supply" if ("csr" in t or "supply" in t) else ("spend" if "spend" in t else None)), "period": period, "comparator": comp, "target": target}
 
 # ---------------------- Graph Nodes ----------------------
 class NodeState(TypedDict):
-    # Per-check state carried across nodes. Keys are read/written by nodes.
     check_text: str
     email: str
-    decision: Literal["mail_tool", "monthly_tool", "skip"]
+    decision: Literal["mail_tool", "email_exists_tool", "monthly_tool", "skip"]
     tool_output: dict | None
     monthly_output: dict | None
     parsed: dict | None
@@ -229,10 +210,12 @@ class NodeState(TypedDict):
 
 
 def classify(state: NodeState) -> NodeState:
-    """Parse the check and decide which tool to run (mail/monthly/skip)."""
+    """Decide which tool to run (mail domain, exact email, monthly, or skip)."""
     check = (state.get("check_text") or "").strip()
     parsed = parse_check(check)
-    if parsed["kind"] == "mail":
+    if parsed["kind"] == "mail_exact":
+        decision = "email_exists_tool"
+    elif parsed["kind"] == "mail_domain":
         decision = "mail_tool"
     elif parsed["kind"] == "monthly":
         decision = "monthly_tool"
@@ -244,9 +227,20 @@ def classify(state: NodeState) -> NodeState:
 
 
 def run_tool(state: NodeState) -> NodeState:
-    """Invoke email domain tool and store its output in the state."""
+    """Invoke email domain tool; if check requires new-only, skip when email already exists."""
     email = state.get("email", "")
+    parsed = state.get("parsed", {}) or {}
+    if parsed.get("new_only") and email_in_contacts(email):
+        state["tool_output"] = {"result": "Skipped", "reason": "Email already known"}
+        return state
     state["tool_output"] = domain_check.invoke({"email": email})
+    return state
+
+
+def run_email_exists_tool(state: NodeState) -> NodeState:
+    """Invoke exact email validation tool and store its output in the state."""
+    email = state.get("email", "")
+    state["tool_output"] = email_exists.invoke({"email": email})
     return state
 
 
@@ -262,7 +256,7 @@ def run_monthly_tool(state: NodeState) -> NodeState:
 def finalize(state: NodeState) -> NodeState:
     """Compute Status/Explanation for mail or monthly checks and return updated state."""
     decision = state.get("decision")
-    if decision == "mail_tool" and state.get("tool_output"):
+    if decision in ("mail_tool", "email_exists_tool") and state.get("tool_output"):
         out = state["tool_output"] or {}
         state["status"] = str(out.get("result", "Failed"))
         state["explanation"] = str(out.get("reason", ""))
@@ -296,22 +290,26 @@ def finalize(state: NodeState) -> NodeState:
 workflow = StateGraph(NodeState)
 workflow.add_node("classify", classify)
 workflow.add_node("run_tool", run_tool)
+workflow.add_node("run_email_exists_tool", run_email_exists_tool)
 workflow.add_node("run_monthly_tool", run_monthly_tool)
 workflow.add_node("finalize", finalize)
 workflow.add_edge(START, "classify")
-workflow.add_conditional_edges("classify", lambda s: s.get("decision"), {"mail_tool": "run_tool", "monthly_tool": "run_monthly_tool", "skip": "finalize"})
+workflow.add_conditional_edges("classify", lambda s: s.get("decision"), {
+    "mail_tool": "run_tool",
+    "email_exists_tool": "run_email_exists_tool",
+    "monthly_tool": "run_monthly_tool",
+    "skip": "finalize"})
 workflow.add_edge("run_tool", "finalize")
+workflow.add_edge("run_email_exists_tool", "finalize")
 workflow.add_edge("run_monthly_tool", "finalize")
 workflow.add_edge("finalize", END)
 
 graph = workflow.compile()
 
 # ---------------------- Runner ----------------------
-# Iterates rows in checks.xlsx, runs the graph, updates checks.xlsx, writes report.xlsx.
 
 def main():
     checks_df = pd.read_excel(CHECKS_PATH)
-    # Ensure required columns
     for col in ["Check", "Email", "Status", "Explanation"]:
         if col not in checks_df.columns:
             checks_df[col] = ""
@@ -353,7 +351,9 @@ def main():
         })
     checks_df.to_excel(CHECKS_PATH, index=False)
     pd.DataFrame(rows).to_excel(REPORT_PATH, index=False)
-    print("LangGraph run complete. Provider:", PROVIDER, "Report:", REPORT_PATH)
+    print("LangGraph run complete. Report:", REPORT_PATH)
 
 if __name__ == "__main__":
     main()
+
+
