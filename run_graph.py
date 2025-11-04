@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 """
 LangGraph workflow: routes checks to either an email-domain tool or a monthly-aggregation tool,
 then writes results back to checks.xlsx and a summary report.xlsx.
@@ -52,7 +51,7 @@ MONTH_NAMES = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
 COMPARATORS = {
     "<": "lt", "<=": "le", ">": "gt", ">=": "ge", "==": "eq", "!=": "ne",
     "less than": "lt", "at most": "le", "greater than": "gt", "at least": "ge",
-    "equals": "eq", "equal": "eq", "not equal": "ne",
+    "equals": "eq", "equal": "eq", "equal to": "eq", "is": "eq", "was": "eq",
 }
 NUM_RE = re.compile(r"(?<![\w.])([0-9]+(?:\.[0-9]+)?)")
 
@@ -114,46 +113,76 @@ def monthly_aggregate(metric: str, period: str) -> dict:
 # ---------------------- Parsing ----------------------
 
 def parse_check(text: str) -> dict:
-    """Parse check text into routing + parameters.
+    """Parse check text into routing + parameters with robust target extraction.
     Extracts:
       - kind: one of "mail", "monthly", or "skip"
       - metric: e.g., "csr_supply" or "spend"
       - period: "month:YYYY-MM" or "week:YYYY-WW"
       - comparator: lt/le/gt/ge/eq/ne (from symbols or natural phrases)
-      - target: numeric value to compare against
+      - target: numeric value (excludes years and period numbers)
     """
-    t = (text or "").lower()
+    original = text or ""
+    t = original.lower()
+
     # Detect intent
     mail_hint = ("email" in t or "domain" in t)
     monthly_hint = ("aggregate" in t or "csr" in t or "supply" in t or "spend" in t or any(k in t for k in COMPARATORS))
 
-    # Comparator phrase
+    # Comparator phrase and span
     comp = None
+    comp_span = None
     for k in sorted(COMPARATORS.keys(), key=len, reverse=True):
-        if k in t:
-            comp = COMPARATORS[k]; break
+        m = re.search(r"\b" + re.escape(k) + r"\b", t)
+        if m:
+            comp = COMPARATORS[k]
+            comp_span = m.span()
+            break
 
-    # Target number
-    m = NUM_RE.search(t)
-    target = float(m.group(1)) if m else None
+    # All number candidates with spans
+    num_matches = [(m.group(1), m.span()) for m in NUM_RE.finditer(t)]
+
+    # Exclude years, year-month parts, and week numbers
+    exclude_spans = []
+    for m in re.finditer(r"\b20\d{2}\b", t):
+        exclude_spans.append(m.span())
+    for m in re.finditer(r"\b(20\d{2})-(\d{1,2})\b", t):
+        exclude_spans.append(m.span(1))
+        exclude_spans.append(m.span(2))
+    for m in re.finditer(r"\bweek\s*(\d{1,2})\b", t):
+        exclude_spans.append(m.span(1))
+
+    def overlaps(span, banned):
+        return any(not (span[1] <= b[0] or span[0] >= b[1]) for b in banned)
+
+    filtered_nums = [(val, span) for (val, span) in num_matches if not overlaps(span, exclude_spans)]
+
+    # Choose target: prefer first number to the right of comparator; else last filtered number
+    target = None
+    if comp_span:
+        right_side = [(val, span) for (val, span) in filtered_nums if span[0] >= comp_span[1]]
+        if right_side:
+            target = float(right_side[0][0])
+    if target is None and filtered_nums:
+        target = float(filtered_nums[-1][0])
 
     # Month parsing
     month = None; year = None
     for name, idx in MONTH_NAMES.items():
-        if name in t:
+        m = re.search(r"\b" + re.escape(name) + r"\b", t)
+        if m:
             month = idx
-            ym = re.search(r"(20\d{2})", t)
+            ym = re.search(r"\b(20\d{2})\b", t)
             year = int(ym.group(1)) if ym else date.today().year
             break
     if not month:
-        ym2 = re.search(r"(20\d{2})-(\d{1,2})", t)
+        ym2 = re.search(r"\b(20\d{2})-(\d{1,2})\b", t)
         if ym2:
             year = int(ym2.group(1)); month = int(ym2.group(2))
 
     # Week parsing
     week = None
     if "week" in t:
-        w = re.search(r"week\s*(\d{1,2})", t)
+        w = re.search(r"\bweek\s*(\d{1,2})\b", t)
         if w:
             week = int(w.group(1))
             if not year:
@@ -162,7 +191,7 @@ def parse_check(text: str) -> dict:
             iso = date.today().isocalendar()
             week = int(iso.week); year = int(iso.year)
 
-    # Metric
+    # Metric detection
     metric = "csr_supply" if ("csr" in t or "supply" in t) else ("spend" if "spend" in t else None)
 
     # Period
@@ -172,13 +201,17 @@ def parse_check(text: str) -> dict:
     elif week and year:
         period = f"week:{year}-{week:02d}"
 
-    # Decide kind (mail takes precedence when only mail is hinted)
+    # Decide kind (mail takes precedence only when monthly not hinted)
     if mail_hint and not monthly_hint:
         kind = "mail"
     elif monthly_hint:
         kind = "monthly"
     else:
         kind = "skip"
+
+    # If numeric check with a bare number and no comparator, assume equals
+    if kind == "monthly" and target is not None and comp is None:
+        comp = "eq"
 
     return {"kind": kind, "metric": metric, "period": period, "comparator": comp, "target": target}
 
@@ -197,7 +230,6 @@ class NodeState(TypedDict):
 
 def classify(state: NodeState) -> NodeState:
     """Parse the check and decide which tool to run (mail/monthly/skip)."""
-    # Parse the raw check text into structured params for routing and tools.
     check = (state.get("check_text") or "").strip()
     parsed = parse_check(check)
     if parsed["kind"] == "mail":
@@ -213,9 +245,7 @@ def classify(state: NodeState) -> NodeState:
 
 def run_tool(state: NodeState) -> NodeState:
     """Invoke email domain tool and store its output in the state."""
-    # Extract email from state; default to empty if missing
     email = state.get("email", "")
-    # Invoke domain_check and store output for finalize
     state["tool_output"] = domain_check.invoke({"email": email})
     return state
 
